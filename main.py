@@ -1,9 +1,17 @@
 from fastapi import Depends, FastAPI, HTTPException
-from data import find_course, get_all_courses
-from models import Course, Stats
 from fastapi.middleware.cors import CORSMiddleware
 
+from data import find_course, get_all_courses
+from models import Course, Enrollment, EnrollmentIn, Stats
+
 app = FastAPI(title="Course Catalog API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # без слэша в конце!
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def pagination(page: int = 1, page_size: int = 20):
@@ -24,20 +32,15 @@ def list_courses(
 ):
     courses = get_all_courses()
 
-    
     if is_elective is not None:
         courses = [c for c in courses if c.is_elective == is_elective]
 
-   
     if sort == "title":
         courses = sorted(courses, key=lambda c: c.title)
     else:
         courses = sorted(courses, key=lambda c: c.likes, reverse=True)
 
-    
-    offset = p["offset"]
-    limit = p["limit"]
-    return courses[offset : offset + limit]
+    return courses[p["offset"] : p["offset"] + p["limit"]]
 
 
 @app.get("/courses/{course_id}", response_model=Course)
@@ -47,22 +50,42 @@ def get_course(course_id: str):
         raise HTTPException(status_code=404, detail="Course not found")
     return course
 
+
 @app.get("/stats", response_model=Stats)
 def get_stats():
     courses = get_all_courses()
-    total = len(courses)
-    total_credits = sum(c.credits for c in courses)
-    electives = sum(1 for c in courses if c.is_elective)
-
     return Stats(
-        total=total,
-        total_credits=total_credits,
-        electives=electives
-)
+        total=len(courses),
+        total_credits=sum(c.credits for c in courses),
+        electives=sum(1 for c in courses if c.is_elective),
+    )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # без слэша в конце!
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+@app.post("/courses/{course_id}/like", response_model=Course)
+def like_course(course_id: str):
+    course = find_course(course_id)
+    if course is None:
+        raise HTTPException(status_code=404, detail="Course not found")
+    course.likes += 1
+    return course
+
+
+ENROLLMENTS: list[Enrollment] = []
+
+
+@app.post("/enrollments", response_model=Enrollment, status_code=201)
+def create_enrollment(data: EnrollmentIn):
+    if find_course(data.course_id) is None:
+        raise HTTPException(status_code=404, detail="Course not found")
+    enrollment = Enrollment(
+        id=len(ENROLLMENTS) + 1,
+        course_id=data.course_id,
+        student_name=data.student_name,
+    )
+    ENROLLMENTS.append(enrollment)
+    return enrollment
+
+
+@app.get("/enrollments", response_model=list[Enrollment])
+def list_enrollments():
+    return ENROLLMENTS
