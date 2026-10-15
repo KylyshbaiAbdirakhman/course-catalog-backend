@@ -1,6 +1,7 @@
 from fastapi import Depends, FastAPI, HTTPException
 from data import find_course, get_all_courses
 from models import Course, Stats
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Course Catalog API")
 
@@ -57,4 +58,11 @@ def get_stats():
         total=total,
         total_credits=total_credits,
         electives=electives
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # без слэша в конце!
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
