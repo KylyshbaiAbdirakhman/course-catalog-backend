@@ -1,22 +1,54 @@
+from typing import Annotated
+
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from data import find_course, get_all_courses
-from models import Course, Enrollment, EnrollmentIn, Stats
+from db import get_db
+from models import Course, Enrollment, Student
+from schemas import (
+    CourseOut,
+    CourseStats,
+    EnrollmentDetail,
+    EnrollmentIn,
+    EnrollmentOut,
+    StudentIn,
+    StudentOut,
+)
 
 app = FastAPI(title="Course Catalog API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # без слэша в конце!
+    allow_origins=["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+SessionDep = Annotated[Session, Depends(get_db)]
+
+# Constraint name -> (HTTP status, message)
+CONSTRAINT_ERRORS: dict[str, tuple[int, str]] = {
+    "students_email_key": (409, "Student with this email already exists"),
+    "enrollments_course_id_student_id_key": (409, "Student is already enrolled in this course"),
+    "enrollments_course_id_fkey": (404, "Course not found"),
+    "enrollments_student_id_fkey": (404, "Student not found"),
+}
+
+
+def raise_http_error(exc: IntegrityError) -> None:
+    constraint = getattr(getattr(exc, "orig", None), "diag", None)
+    name = getattr(constraint, "constraint_name", None) if constraint else None
+    if name and name in CONSTRAINT_ERRORS:
+        status, detail = CONSTRAINT_ERRORS[name]
+        raise HTTPException(status_code=status, detail=detail)
+    raise exc
+
 
 def pagination(page: int = 1, page_size: int = 20):
-    offset = (page - 1) * page_size
-    return {"offset": offset, "limit": page_size}
+    return {"offset": (page - 1) * page_size, "limit": page_size}
 
 
 @app.get("/")
@@ -24,68 +56,103 @@ def read_root():
     return {"message": "Course Catalog API is running"}
 
 
-@app.get("/courses", response_model=list[Course])
+@app.get("/courses", response_model=list[CourseOut])
 def list_courses(
+    db: SessionDep,
     is_elective: bool | None = None,
+    level: str | None = None,
     sort: str = "popular",
     p: dict = Depends(pagination),
 ):
-    courses = get_all_courses()
-
+    stmt = select(Course)
     if is_elective is not None:
-        courses = [c for c in courses if c.is_elective == is_elective]
-
+        stmt = stmt.where(Course.is_elective == is_elective)
+    if level is not None:
+        stmt = stmt.where(Course.level == level)
     if sort == "title":
-        courses = sorted(courses, key=lambda c: c.title)
+        stmt = stmt.order_by(Course.title)
     else:
-        courses = sorted(courses, key=lambda c: c.likes, reverse=True)
+        stmt = stmt.order_by(Course.likes.desc(), Course.id)
+    stmt = stmt.limit(p["limit"]).offset(p["offset"])
+    return db.scalars(stmt).all()
 
-    return courses[p["offset"] : p["offset"] + p["limit"]]
 
-
-@app.get("/courses/{course_id}", response_model=Course)
-def get_course(course_id: str):
-    course = find_course(course_id)
+@app.get("/courses/{course_id}", response_model=CourseOut)
+def get_course(course_id: str, db: SessionDep):
+    course = db.get(Course, course_id)
     if course is None:
         raise HTTPException(status_code=404, detail="Course not found")
     return course
 
 
-@app.get("/stats", response_model=Stats)
-def get_stats():
-    courses = get_all_courses()
-    return Stats(
-        total=len(courses),
-        total_credits=sum(c.credits for c in courses),
-        electives=sum(1 for c in courses if c.is_elective),
+@app.post("/courses/{course_id}/like", response_model=CourseOut)
+def like_course(course_id: str, db: SessionDep):
+    stmt = (
+        update(Course)
+        .where(Course.id == course_id)
+        .values(likes=Course.likes + 1)
+        .returning(Course)
     )
-
-
-@app.post("/courses/{course_id}/like", response_model=Course)
-def like_course(course_id: str):
-    course = find_course(course_id)
+    course = db.scalars(stmt).one_or_none()
     if course is None:
         raise HTTPException(status_code=404, detail="Course not found")
-    course.likes += 1
+    db.commit()
     return course
 
 
-ENROLLMENTS: list[Enrollment] = []
+@app.post("/students", response_model=StudentOut, status_code=201)
+def create_student(data: StudentIn, db: SessionDep):
+    student = Student(name=data.name, email=data.email)
+    db.add(student)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise_http_error(exc)
+    db.refresh(student)
+    return student
 
 
-@app.post("/enrollments", response_model=Enrollment, status_code=201)
-def create_enrollment(data: EnrollmentIn):
-    if find_course(data.course_id) is None:
-        raise HTTPException(status_code=404, detail="Course not found")
-    enrollment = Enrollment(
-        id=len(ENROLLMENTS) + 1,
-        course_id=data.course_id,
-        student_name=data.student_name,
-    )
-    ENROLLMENTS.append(enrollment)
+@app.post("/enrollments", response_model=EnrollmentOut, status_code=201)
+def create_enrollment(data: EnrollmentIn, db: SessionDep):
+    enrollment = Enrollment(course_id=data.course_id, student_id=data.student_id)
+    db.add(enrollment)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise_http_error(exc)
+    db.refresh(enrollment)
     return enrollment
 
 
-@app.get("/enrollments", response_model=list[Enrollment])
-def list_enrollments():
-    return ENROLLMENTS
+@app.get("/enrollments", response_model=list[EnrollmentDetail])
+def list_enrollments(db: SessionDep):
+    stmt = (
+        select(
+            Enrollment.id,
+            Enrollment.course_id,
+            Course.title.label("course_title"),
+            Enrollment.student_id,
+            Student.name.label("student_name"),
+            Enrollment.enrolled_at,
+        )
+        .join(Enrollment.course)
+        .join(Enrollment.student)
+        .order_by(Enrollment.id)
+    )
+    return db.execute(stmt).all()
+
+
+@app.get("/stats/courses", response_model=list[CourseStats])
+def course_stats(db: SessionDep):
+    stmt = (
+        select(
+            Course.id.label("course_id"),
+            func.count(Enrollment.id).label("enrolled"),
+        )
+        .outerjoin(Course.enrollments)
+        .group_by(Course.id)
+        .order_by(func.count(Enrollment.id).desc(), Course.id)
+    )
+    return db.execute(stmt).all()
