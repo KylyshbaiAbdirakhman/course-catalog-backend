@@ -3,3 +3,4 @@ sqlalchemy==2.0.36
 psycopg[binary]
 alembic
 pydantic-settings
+strawberry-graphql[fastapi]
