@@ -4,11 +4,11 @@ URL = "http://localhost:8000/graphql"
 
 QUERIES = [
     (
-        "students → enrollments → course",
+        "students -> enrollments -> course",
         "{ students { name enrollments { course { title } } } }",
     ),
     (
-        "enrollments → course, student",
+        "enrollments -> course, student",
         "{ enrollments { id course { title } student { name } } }",
     ),
 ]

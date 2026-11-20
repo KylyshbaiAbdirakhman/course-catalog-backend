@@ -23,7 +23,7 @@ CASES = [
      lambda d: d["data"]["course"]["title"], "API Design: REST vs GraphQL"),
     ('course(id: "nope")', '{ course(id: "nope") { title } }',
      lambda d: str(d["data"]["course"]), "None"),
-    ("student(id: 2) → courses", "{ student(id: 2) { enrollments { course { id } } } }",
+    ("student(id: 2) -> courses", "{ student(id: 2) { enrollments { course { id } } } }",
      lambda d: str(len(d["data"]["student"]["enrollments"])), "3"),
     ("enroll twice", enroll("ai-integration", "3"),
      lambda d: d["data"]["enroll"]["userErrors"][0]["code"], "ALREADY_ENROLLED"),
