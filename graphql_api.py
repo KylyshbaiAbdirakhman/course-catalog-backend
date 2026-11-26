@@ -1,6 +1,6 @@
 from collections import defaultdict
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Optional
 
 import strawberry
 from fastapi import Depends
@@ -15,12 +15,14 @@ from strawberry.extensions import (
     QueryDepthLimiter,
 )
 from strawberry.fastapi import BaseContext, GraphQLRouter
+from strawberry.permission import BasePermission
 from strawberry.types import Info
 
 import services
+from auth import can_access_student, get_optional_user
 from config import settings
 from db import get_db
-from models import Course, Enrollment, Student
+from models import Course, Enrollment, Student, User
 
 
 # ---------------------------------------------------------------------------
@@ -73,22 +75,64 @@ def batch_loader(db: Session, column, many: bool = False) -> DataLoader:
 class Context(BaseContext):
     """Created per request: the session and loaders don't outlive the request."""
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, user: Optional[User]):
         super().__init__()
         self.db = db
+        self.user = user
         self.course = batch_loader(db, Course.id)
         self.student = batch_loader(db, Student.id)
         self.enrollments_of_course = batch_loader(db, Enrollment.course_id, many=True)
         self.enrollments_of_student = batch_loader(db, Enrollment.student_id, many=True)
 
 
-def get_context(db: Annotated[Session, Depends(get_db)]) -> Context:
-    return Context(db)
+def get_context(
+    db: Annotated[Session, Depends(get_db)],
+    user: Annotated[Optional[User], Depends(get_optional_user)],
+) -> Context:
+    return Context(db, user)
+
+
+# ---------------------------------------------------------------------------
+# Permission classes
+# ---------------------------------------------------------------------------
+
+class IsAuthenticated(BasePermission):
+    message = "Authentication required"
+
+    def has_permission(self, source, info: Info, **kwargs) -> bool:
+        return info.context.user is not None
+
+
+class IsAdmin(BasePermission):
+    message = "Admin role required"
+
+    def has_permission(self, source, info: Info, **kwargs) -> bool:
+        user = info.context.user
+        return user is not None and user.role == "admin"
+
+
+class IsSelfOrAdmin(BasePermission):
+    """For Student fields: source is the student row itself."""
+
+    message = "Not allowed to read this field"
+
+    def has_permission(self, source, info: Info, **kwargs) -> bool:
+        user = info.context.user
+        if user is None:
+            return False
+        return can_access_student(user, int(source.id))
 
 
 # ---------------------------------------------------------------------------
 # GraphQL types
 # ---------------------------------------------------------------------------
+
+@strawberry.type(name="User")
+class UserType:
+    id: strawberry.ID
+    email: str
+    role: str
+
 
 @strawberry.type(name="Course")
 class CourseType:
@@ -109,7 +153,7 @@ class CourseType:
 class StudentType:
     id: strawberry.ID
     name: str
-    email: str
+    email: Optional[str] = strawberry.field(permission_classes=[IsSelfOrAdmin])
 
     @strawberry.field
     async def enrollments(self, info: Info) -> list["EnrollmentType"]:
@@ -150,13 +194,13 @@ class EnrollInput:
 
 @strawberry.type
 class EnrollPayload:
-    enrollment: EnrollmentType | None = None
+    enrollment: Optional[EnrollmentType] = None
     user_errors: list[UserError] = strawberry.field(default_factory=list)
 
 
 @strawberry.type
 class LikePayload:
-    course: CourseType | None = None
+    course: Optional[CourseType] = None
     user_errors: list[UserError] = strawberry.field(default_factory=list)
 
 
@@ -172,7 +216,7 @@ def as_user_errors(err: services.ServiceError) -> list[UserError]:
 class Query:
     @strawberry.field
     def courses(
-        self, info: Info, is_elective: bool | None = None, limit: int = 20
+        self, info: Info, is_elective: Optional[bool] = None, limit: int = 20
     ) -> list[CourseType]:
         stmt = select(Course).order_by(Course.likes.desc(), Course.id).limit(
             check_limit(limit)
@@ -182,22 +226,26 @@ class Query:
         return info.context.db.scalars(stmt).all()
 
     @strawberry.field
-    def course(self, info: Info, id: strawberry.ID) -> CourseType | None:
+    def course(self, info: Info, id: strawberry.ID) -> Optional[CourseType]:
         return info.context.db.get(Course, id)
 
-    @strawberry.field
+    @strawberry.field(permission_classes=[IsAdmin])
     def students(self, info: Info, limit: int = 20) -> list[StudentType]:
         stmt = select(Student).order_by(Student.id).limit(check_limit(limit))
         return info.context.db.scalars(stmt).all()
 
     @strawberry.field
-    def student(self, info: Info, id: strawberry.ID) -> StudentType | None:
+    def student(self, info: Info, id: strawberry.ID) -> Optional[StudentType]:
         return info.context.db.get(Student, parse_id(id))
 
     @strawberry.field
     def enrollments(self, info: Info, limit: int = 20) -> list[EnrollmentType]:
         stmt = select(Enrollment).order_by(Enrollment.id).limit(check_limit(limit))
         return info.context.db.scalars(stmt).all()
+
+    @strawberry.field(permission_classes=[IsAuthenticated])
+    def me(self, info: Info) -> UserType:
+        return info.context.user
 
 
 # ---------------------------------------------------------------------------
